@@ -9,16 +9,26 @@ import glob
 import math
 from datetime import datetime
 
-# --- CONFIGURATION ---
-# HuggingFace URL for the specific version of Samsung Notes that works with these hooks
+# --- CONFIGURATION & TUNING ---
+# These are loaded from GitHub Actions Inputs
+try:
+    # How aggressive the smoothing is (Higher = Smoother but less detail)
+    # Default: 2.0 pixels
+    MIN_DISTANCE = float(os.environ.get("OPT_SMOOTH_DIST", 2.0))
+    
+    # Global scaling for handwriting (Lower = Thinner/Sharper)
+    # Default: 0.5 (50% of original Samsung width)
+    THINNING_SCALE = float(os.environ.get("OPT_THIN_SCALE", 0.5))
+except ValueError:
+    MIN_DISTANCE = 2.0
+    THINNING_SCALE = 0.5
+
+# Static Config
 SNOTES_APPX_URL = "https://huggingface.co/datasets/Jaimodiji/SAMSUNG-NOTES/resolve/main/snotes.Msixbundle"
 APP_FILENAME = "SamsungNotes.Msixbundle"
 TARGET_NOTE = "input_note.sdocx"
 OUTPUT_SVG = "Final_Export.svg"
 EXPORT_PDF_PATH = r"C:\Temp\dummy_export.pdf"
-
-# Tuning for Smoothing
-MIN_DISTANCE = 2.0   
 
 # --- LOGGING HELPER ---
 def log(msg):
@@ -46,16 +56,27 @@ def generate_smooth_path(stroke_data, base_color):
 
     if len(raw_points) < 2: return ""
 
-    # 1. ADAPTIVE SCALING (Fixes the "Thick Line" issue)
-    if raw_width > 3.0: base_width = raw_width * 0.35 # Calligraphy
-    elif raw_width > 1.5: base_width = raw_width * 0.60 # Marker
-    else: base_width = raw_width * 0.90 # Pen
+    # 1. ADAPTIVE SCALING (Using User Config)
+    # Samsung raw width is often huge (4.0+), so we scale it down relative to the user setting.
+    
+    # If THINNING_SCALE is 0.5, we apply logic:
+    if raw_width > 3.0: 
+        # Calligraphy gets hit hardest (0.7x the user scale)
+        base_width = raw_width * (THINNING_SCALE * 0.7)
+    elif raw_width > 1.5: 
+        # Marker gets standard scaling
+        base_width = raw_width * (THINNING_SCALE * 1.2)
+    else: 
+        # Thin pens stay mostly original (90% of raw)
+        base_width = raw_width * 0.90 
 
     # 2. FILTER & SMOOTH PRESSURE
     clean_points = [raw_points[0]]
     for i in range(1, len(raw_points)):
         dist = math.hypot(raw_points[i]['x'] - clean_points[-1]['x'], 
                           raw_points[i]['y'] - clean_points[-1]['y'])
+        
+        # Use User Configured Distance
         if dist > MIN_DISTANCE:
             # Square pressure for sharper taper at ends
             p_smooth = (raw_points[i]['p'] + clean_points[-1]['p']) / 2
@@ -83,6 +104,7 @@ def generate_smooth_path(stroke_data, base_color):
         if len_v == 0: nx, ny = 0, 0
         else: nx, ny = -dy / len_v, dx / len_v
 
+        # Calculate Width
         width = base_width * p['p']
         if width < 0.5: width = 0.5 
 
@@ -114,16 +136,12 @@ def generate_smooth_path(stroke_data, base_color):
 
 def install_pip_deps():
     log("[SETUP] Installing Python Dependencies...")
-    # Explicitly including pyautogui and pillow
     packages = ["frida", "frida-tools", "uiautomation", "requests", "pyautogui", "pillow"]
     subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages)
 
 def install_local_dependencies():
     log("[SETUP] Looking for Dependency Appx files in repo...")
     dep_files = glob.glob("*.Appx") + glob.glob("*.AppxBundle")
-    
-    if not dep_files:
-        log("[SETUP] Warning: No dependency Appx files found in root.")
     
     for dep in dep_files:
         if "SamsungNotes" in dep: continue
@@ -150,9 +168,8 @@ def install_samsung_notes():
     log("[SETUP] Installing Samsung Notes Appx...")
     cmd = ["powershell", "Add-AppxPackage", "-Path", APP_FILENAME, "-ForceUpdateFromAnyVersion", "-AllowUnsigned"]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
     if result.returncode != 0:
-        log(f"[SETUP] App Install Warning (Output): {result.stderr}")
+        log(f"[SETUP] App Install Warning: {result.stderr}")
     else:
         log("[SETUP] App Installed Successfully.")
 
@@ -223,10 +240,7 @@ function main() {
                 }
                 const penSize = getPenSize ? getPenSize(this.stroke) : 2.0;
                 
-                // Hash to avoid duplicates
                 const fullHash = count + "_" + color + "_" + hashSample;
-                
-                // Send raw data to Python for geometry processing
                 send(`${fullHash}||${penSize}|${dataStr}||${color}`);
 
             } catch (e) {}
@@ -253,8 +267,6 @@ def on_message(message, data):
             hsh, stroke_data, color = message['payload'].split("||", 2)
             if hsh not in saved_hashes:
                 saved_hashes.add(hsh)
-                
-                # Use the Geometry Engine to make it look nice
                 svg = generate_smooth_path(stroke_data, color)
                 if svg:
                     svg_buffer.append(svg)
@@ -263,11 +275,9 @@ def on_message(message, data):
         except: pass
 
 def drive_ui():
-    # Import inside thread to ensure it's loaded after install
     import pyautogui
-    
     log("[UI] Thread Started.")
-    log("[UI] Waiting 5 seconds for App Window to stabilize...")
+    log("[UI] Waiting 5 seconds for App Window...")
     time.sleep(5) 
     
     # 1. Clear Popups
@@ -278,7 +288,6 @@ def drive_ui():
     time.sleep(1)
 
     # 2. Navigate to Share Menu
-    # UPDATED: 7 Tabs instead of 8 based on user feedback
     log("[UI] Step 2: Navigating to Toolbar (7x Tab)...")
     for i in range(7):
         pyautogui.press('tab')
@@ -302,9 +311,7 @@ def drive_ui():
     
     # 5. Save Dialog
     log(f"[UI] Step 5: Handling Save Dialog...")
-    
-    if not os.path.exists("C:\\Temp"): 
-        os.makedirs("C:\\Temp")
+    if not os.path.exists("C:\\Temp"): os.makedirs("C:\\Temp")
 
     pyautogui.write(EXPORT_PDF_PATH)
     time.sleep(0.5)
@@ -319,26 +326,22 @@ def drive_ui():
     log("[UI] Automation Sequence Complete.")
 
 def main():
-    # 1. INSTALLATION
+    log(f"[CONFIG] Smooth Dist: {MIN_DISTANCE}px | Thin Scale: {THINNING_SCALE}")
+
     install_pip_deps()
     install_local_dependencies()
     install_samsung_notes()
-    
-    # Late import
     import frida
 
     if not os.path.exists(TARGET_NOTE):
-        log(f"[-] FATAL: {TARGET_NOTE} not found in working directory.")
+        log(f"[-] FATAL: {TARGET_NOTE} not found.")
         return
 
-    # 2. LAUNCH
     log(f"[LAUNCH] Opening {TARGET_NOTE} via Windows Shell...")
     os.startfile(TARGET_NOTE)
-    
     log("[LAUNCH] Waiting 8 seconds for application startup...")
     time.sleep(8)
 
-    # 3. FRIDA ATTACH
     try:
         log("[FRIDA] Attaching process...")
         session = frida.attach("SamsungNotes.exe")
@@ -351,17 +354,13 @@ def main():
         os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
         sys.exit(1)
 
-    # 4. DRIVE UI
     t = threading.Thread(target=drive_ui)
     t.start()
     t.join()
     
-    # 5. HARVEST
     log("[HARVEST] Waiting for data stream to finish...")
     last_val = -1
     no_change = 0
-    
-    # Wait max 60 seconds for export to complete
     for _ in range(60):
         time.sleep(1)
         if len(svg_buffer) > 0 and len(svg_buffer) == last_val:
@@ -369,13 +368,10 @@ def main():
         else:
             no_change = 0
         last_val = len(svg_buffer)
-        
-        # If we have data and it hasn't changed for 5 seconds, we assume export is done
         if len(svg_buffer) > 0 and no_change > 5:
             log("[HARVEST] Data stream stabilized. Finishing.")
             break
             
-    # 6. SAVE OUTPUT
     if svg_buffer:
         log(f"[SAVE] Writing {len(svg_buffer)} strokes to {OUTPUT_SVG}...")
         with open(OUTPUT_SVG, "w", encoding="utf-8") as f:
@@ -386,14 +382,12 @@ def main():
             f.write('</svg>')
         log(f"[SUCCESS] File saved: {OUTPUT_SVG}")
     else:
-        log("[-] FAILURE: No data was captured. The export might have failed or UI nav was blocked.")
+        log("[-] FAILURE: No data was captured.")
 
-    # 7. CLEANUP
-    try:
-        session.detach()
+    try: session.detach()
     except: pass
     os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
-    log("[EXIT] Process killed. Job done.")
+    log("[EXIT] Job done.")
 
 if __name__ == "__main__":
     main()
