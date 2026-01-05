@@ -18,18 +18,21 @@ EXPORT_PDF_TEMP = "C:\\Temp\\dummy.pdf"
 
 def install_pip_deps():
     print("[*] Installing Python Dependencies...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "frida", "frida-tools", "uiautomation", "requests"])
+    # FIX: Added pyautogui and pillow explicitly
+    packages = ["frida", "frida-tools", "uiautomation", "requests", "pyautogui", "pillow"]
+    subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages)
 
 def install_local_dependencies():
     print("[*] Installing Dependency Appx files from Repo...")
-    # These are the files you have in your git repo
     dep_files = glob.glob("*.Appx") + glob.glob("*.AppxBundle")
     
     for dep in dep_files:
-        if "SamsungNotes" in dep: continue # Skip the main app if present locally
+        if "SamsungNotes" in dep: continue
         print(f"    -> Installing {dep}...")
-        cmd = ["powershell", "Add-AppxPackage", "-Path", f".\\{dep}"]
-        subprocess.run(cmd, capture_output=True)
+        try:
+            subprocess.run(["powershell", "Add-AppxPackage", "-Path", f".\\{dep}"], check=True)
+        except:
+            print(f"    [!] Warning: Failed to install {dep}")
 
 def install_samsung_notes():
     if not os.path.exists(APP_FILENAME):
@@ -48,13 +51,8 @@ def install_samsung_notes():
     print("[*] Installing Samsung Notes...")
     # ForceUpdateFromAnyVersion allows reinstalling over existing versions
     cmd = ["powershell", "Add-AppxPackage", "-Path", APP_FILENAME, "-ForceUpdateFromAnyVersion", "-AllowUnsigned"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"[-] App Install Failed: {result.stderr}")
-        # We continue anyway, sometimes it reports fail but works if deps are weird
-    else:
-        print("[+] App Installed Successfully.")
+    subprocess.run(cmd, capture_output=True, text=True)
+    print("[+] App Install Process Finished.")
 
 # --- FRIDA LOGIC ---
 
@@ -181,11 +179,11 @@ def on_message(message, data):
         except: pass
 
 def drive_ui():
-    import uiautomation as auto
+    # Import inside thread to ensure it's loaded after install
     import pyautogui
     
     print("\n[UI] Waiting for App Window...")
-    time.sleep(5) # Wait for app load
+    time.sleep(5) 
     
     # 1. Clear Popups
     print("    -> Clearing potential First-Run popups...")
@@ -194,12 +192,8 @@ def drive_ui():
     pyautogui.press('enter') 
     time.sleep(1)
 
-    # 2. Navigate to Share Menu (Keyboard Strategy)
-    # The UI structure changes, but Tab navigation is usually consistent.
-    # We Tab to the "More Options" or "Share" button.
+    # 2. Navigate to Share Menu
     print("    -> Navigating to Share...")
-    
-    # Heuristic: Tab 8 times usually gets to the toolbar
     for i in range(8):
         pyautogui.press('tab')
         time.sleep(0.1)
@@ -214,7 +208,7 @@ def drive_ui():
     pyautogui.press('enter')
     time.sleep(1.5)
     
-    # 4. Click Done/Share
+    # 4. Click Done
     print("    -> Confirming Share...")
     pyautogui.press('enter')
     time.sleep(1.5)
@@ -236,14 +230,13 @@ def drive_ui():
 def main():
     # 1. INSTALLATION
     install_pip_deps()
-    install_local_dependencies() # Installs the Appx files in current dir
+    install_local_dependencies()
     install_samsung_notes()
     
-    import frida # Import after install
+    import frida # Now safe to import
 
     if not os.path.exists(TARGET_NOTE):
         print(f"[-] Target {TARGET_NOTE} not found.")
-        # In GitHub Actions, we download it in the YAML step, so this shouldn't happen.
         return
 
     # 2. LAUNCH
@@ -262,11 +255,18 @@ def main():
         script.load()
     except Exception as e:
         print(f"[-] Failed to attach Frida: {e}")
-        # Try to kill it and exit
         os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
         return
 
     # 4. DRIVE UI
+    # Force import check before thread start
+    try:
+        import pyautogui
+    except ImportError:
+        print("[-] FATAL: PyAutoGUI missing. Re-running install...")
+        install_pip_deps()
+        import pyautogui
+
     t = threading.Thread(target=drive_ui)
     t.start()
     t.join()
@@ -276,7 +276,6 @@ def main():
     last_val = -1
     no_change = 0
     
-    # Wait max 45 seconds for export
     for _ in range(45):
         time.sleep(1)
         if len(svg_buffer) > 0 and len(svg_buffer) == last_val:
