@@ -4,16 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       sdocx_url:
-        description: 'Direct Download URL of the .sdocx file'
+        description: 'Direct URL to .sdocx file'
         required: true
-        default: 'https://file-examples.com/example.sdocx' # Replace with a default if you want
 
 jobs:
-  export_notes:
+  export:
     runs-on: windows-latest
     
     steps:
-    - name: Checkout Repo (Get Scripts & Appx)
+    - name: Checkout Repo
       uses: actions/checkout@v3
 
     - name: Set up Python
@@ -26,14 +25,20 @@ jobs:
         Invoke-WebRequest -Uri "${{ github.event.inputs.sdocx_url }}" -OutFile "input_note.sdocx"
       shell: powershell
 
-    - name: Run Exporter Script
-      run: |
-        python export_script.py
+    - name: Run Extraction
+      run: python export_script.py
       shell: cmd
 
-    - name: Upload SVG Artifact
+    - name: Upload SVG (Success)
       if: success()
       uses: actions/upload-artifact@v4
       with:
         name: Converted-SVG
         path: Final_Export.svg
+
+    - name: Upload Debug Screenshots (Always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Debug-Screenshots
+        path: Debug_Screenshots/
