@@ -6,74 +6,115 @@ import time
 import ctypes
 import threading
 import glob
+import math
 from datetime import datetime
 
 # --- CONFIGURATION ---
+# HuggingFace URL for the specific version of Samsung Notes that works with these hooks
 SNOTES_APPX_URL = "https://huggingface.co/datasets/Jaimodiji/SAMSUNG-NOTES/resolve/main/snotes.Msixbundle"
 APP_FILENAME = "SamsungNotes.Msixbundle"
 TARGET_NOTE = "input_note.sdocx"
 OUTPUT_SVG = "Final_Export.svg"
 EXPORT_PDF_PATH = r"C:\Temp\dummy_export.pdf"
-SCREENSHOT_DIR = "Debug_Screenshots"
 
-# Global flags
-stop_threads = False
+# Tuning for Smoothing
+MIN_DISTANCE = 2.0   
 
-# --- LOGGING & SCREENSHOTS ---
+# --- LOGGING HELPER ---
 def log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {msg}", flush=True)
 
-def take_snapshot(name="auto"):
-    """Captures the screen for debugging."""
-    if not os.path.exists(SCREENSHOT_DIR): os.makedirs(SCREENSHOT_DIR)
-    
+# --- GEOMETRY ENGINE (Python Side) ---
+def get_midpoint(p1, p2):
+    return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+
+def generate_smooth_path(stroke_data, base_color):
+    """
+    Converts raw stroke data into a smooth, tapered Bezier SVG path.
+    """
     try:
-        import pyautogui
-        timestamp = datetime.now().strftime("%H_%M_%S")
-        filename = f"{SCREENSHOT_DIR}\\{timestamp}_{name}.png"
-        pyautogui.screenshot(filename)
-        log(f"[SNAPSHOT] Saved {filename}")
-    except Exception as e:
-        log(f"[SNAPSHOT] Failed: {e}")
-
-def paparazzi_thread():
-    """Takes a screenshot every 3 seconds."""
-    while not stop_threads:
-        take_snapshot("interval")
-        time.sleep(3)
-
-# --- SYSTEM CHECKS ---
-def check_system_capabilities():
-    log("[SYSTEM] Verifying Display and Mouse subsystems...")
-    
-    try:
-        user32 = ctypes.windll.user32
+        header, body = stroke_data.split("|", 1)
+        raw_width = float(header)
+        points_raw = body.split(" ")
         
-        # 1. Check Screen Resolution
-        width = user32.GetSystemMetrics(0)
-        height = user32.GetSystemMetrics(1)
-        log(f"[SYSTEM] Virtual Display Detected: {width}x{height}")
-        
-        if width == 0 or height == 0:
-            log("[-] FATAL: No display detected. UI Automation will fail.")
-            sys.exit(1)
+        raw_points = []
+        for p_str in points_raw:
+            x, y, p = map(float, p_str.split(','))
+            raw_points.append({'x': x, 'y': y, 'p': p})
+    except: return ""
 
-        # 2. Check Cursor
-        pt = ctypes.wintypes.POINT()
-        if user32.GetCursorPos(ctypes.byref(pt)):
-            log(f"[SYSTEM] Mouse Cursor active at ({pt.x}, {pt.y})")
+    if len(raw_points) < 2: return ""
+
+    # 1. ADAPTIVE SCALING (Fixes the "Thick Line" issue)
+    if raw_width > 3.0: base_width = raw_width * 0.35 # Calligraphy
+    elif raw_width > 1.5: base_width = raw_width * 0.60 # Marker
+    else: base_width = raw_width * 0.90 # Pen
+
+    # 2. FILTER & SMOOTH PRESSURE
+    clean_points = [raw_points[0]]
+    for i in range(1, len(raw_points)):
+        dist = math.hypot(raw_points[i]['x'] - clean_points[-1]['x'], 
+                          raw_points[i]['y'] - clean_points[-1]['y'])
+        if dist > MIN_DISTANCE:
+            # Square pressure for sharper taper at ends
+            p_smooth = (raw_points[i]['p'] + clean_points[-1]['p']) / 2
+            raw_points[i]['p'] = p_smooth * p_smooth 
+            clean_points.append(raw_points[i])
+            
+    if clean_points[-1] != raw_points[-1]: clean_points.append(raw_points[-1])
+    if len(clean_points) < 2: return ""
+
+    # 3. CALCULATE OUTLINE
+    left_side = []
+    right_side = []
+
+    for i in range(len(clean_points)):
+        p = clean_points[i]
+        
+        if i < len(clean_points) - 1:
+            nxt = clean_points[i+1]
+            dx, dy = nxt['x'] - p['x'], nxt['y'] - p['y']
         else:
-            log("[-] Warning: Could not get cursor position.")
+            prev = clean_points[i-1]
+            dx, dy = p['x'] - prev['x'], p['y'] - prev['y']
 
-    except Exception as e:
-        log(f"[-] System Check Error: {e}")
-        # We continue anyway because sometimes CI environments are weird
+        len_v = math.hypot(dx, dy)
+        if len_v == 0: nx, ny = 0, 0
+        else: nx, ny = -dy / len_v, dx / len_v
+
+        width = base_width * p['p']
+        if width < 0.5: width = 0.5 
+
+        left_side.append( (p['x'] + nx * width, p['y'] + ny * width) )
+        right_side.append( (p['x'] - nx * width, p['y'] - ny * width) )
+
+    # 4. SVG PATH (Q Bezier)
+    d = f"M {left_side[0][0]:.2f} {left_side[0][1]:.2f} "
+    
+    for i in range(1, len(left_side)):
+        p0 = left_side[i-1]
+        p1 = left_side[i]
+        mid = get_midpoint(p0, p1)
+        d += f"Q {p0[0]:.2f} {p0[1]:.2f} {mid[0]:.2f} {mid[1]:.2f} "
+    
+    d += f"L {left_side[-1][0]:.2f} {left_side[-1][1]:.2f} "
+    d += f"L {right_side[-1][0]:.2f} {right_side[-1][1]:.2f} "
+
+    for i in range(len(right_side) - 2, -1, -1):
+        p0 = right_side[i+1]
+        p1 = right_side[i]
+        mid = get_midpoint(p0, p1)
+        d += f"Q {p0[0]:.2f} {p0[1]:.2f} {mid[0]:.2f} {mid[1]:.2f} "
+
+    d += "Z"
+    return f'<path d="{d}" fill="{base_color}" stroke="none" />'
 
 # --- INSTALLATION LOGIC ---
 
 def install_pip_deps():
     log("[SETUP] Installing Python Dependencies...")
+    # Explicitly including pyautogui and pillow
     packages = ["frida", "frida-tools", "uiautomation", "requests", "pyautogui", "pillow"]
     subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages)
 
@@ -81,13 +122,16 @@ def install_local_dependencies():
     log("[SETUP] Looking for Dependency Appx files in repo...")
     dep_files = glob.glob("*.Appx") + glob.glob("*.AppxBundle")
     
+    if not dep_files:
+        log("[SETUP] Warning: No dependency Appx files found in root.")
+    
     for dep in dep_files:
         if "SamsungNotes" in dep: continue
         log(f"[SETUP] Installing Dependency: {dep}")
         try:
             subprocess.run(["powershell", "Add-AppxPackage", "-Path", f".\\{dep}"], check=True)
         except Exception as e:
-            log(f"[SETUP] Warning: Failed to install {dep}")
+            log(f"[SETUP] Warning: Failed to install {dep} ({e})")
 
 def install_samsung_notes():
     if not os.path.exists(APP_FILENAME):
@@ -116,11 +160,6 @@ def install_samsung_notes():
 
 jscode = """
 const docModule = "libSpen_document.dll";
-
-// Smart Thinning Config
-const THRESHOLD = 0.15;
-const MOD_REDUCE = 0.50; 
-const MOD_KEEP = 0.95;
 
 const names = {
     point: "?GetPoint@ObjectStroke@SPen@@QEBAPEBUPointF@2@XZ",
@@ -157,42 +196,24 @@ function main() {
                 if (count < 2 || count > 50000) return;
 
                 const pointsPtr = retval;
-                let pts = [];
-                let rawData = ""; 
+                const pressurePtr = getPressure ? getPressure(this.stroke) : ptr(0);
                 
-                let minP = 1.0, maxP = 0.0;
-                let hasP = false;
-
-                if (getPressure) {
-                    const pPtr = getPressure(this.stroke);
-                    if (!pPtr.isNull()) {
-                        hasP = true;
-                        for (let k = 0; k < count; k++) {
-                            let v = pPtr.add(k*4).readFloat();
-                            if (v < minP) minP = v;
-                            if (v > maxP) maxP = v;
-                        }
-                    }
-                }
-
-                let scale = MOD_KEEP;
-                const rawSize = getPenSize ? getPenSize(this.stroke) : 2.0;
-                
-                if (rawSize > 3.0) scale = 0.35; 
-                else if (hasP && (maxP - minP) > THRESHOLD) scale = MOD_REDUCE;
-                
-                let finalSize = rawSize * scale;
-                if (finalSize < 0.5) finalSize = 0.5;
+                let dataStr = "";
+                let hashSample = ""; 
 
                 for (let i = 0; i < count; i++) {
-                    let p = pointsPtr.add(i * 8);
-                    let x = p.readFloat().toFixed(2);
-                    let y = p.add(4).readFloat().toFixed(2);
-                    
-                    if (pts.length === 0 || cur !== pts[pts.length-1]) {
-                        pts.push(x + "," + y);
-                        rawData += x + y; 
+                    let x = pointsPtr.add(i*8).readFloat().toFixed(2);
+                    let y = pointsPtr.add(i*8+4).readFloat().toFixed(2);
+                    let p = "0.5";
+                    if (!pressurePtr.isNull()) {
+                        p = pressurePtr.add(i*4).readFloat().toFixed(3);
                     }
+                    let ptStr = `${x},${y},${p}`;
+                    
+                    if (i === 0) dataStr += ptStr;
+                    else dataStr += " " + ptStr;
+
+                    if (i < 3 || i > count - 3) hashSample += ptStr;
                 }
 
                 let color = "#000000";
@@ -200,11 +221,13 @@ function main() {
                     let fullHex = getColor(this.stroke).toString(16).padStart(8, '0');
                     color = "#" + fullHex.substring(2, 8);
                 }
-
-                const fullHash = count + "_" + color + "_" + rawData.substring(0, 50);
-                const svgLine = `<polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="${finalSize.toFixed(2)}" stroke-linecap="round" stroke-linejoin="round" />`;
+                const penSize = getPenSize ? getPenSize(this.stroke) : 2.0;
                 
-                send(fullHash + "||" + svgLine);
+                // Hash to avoid duplicates
+                const fullHash = count + "_" + color + "_" + hashSample;
+                
+                // Send raw data to Python for geometry processing
+                send(`${fullHash}||${penSize}|${dataStr}||${color}`);
 
             } catch (e) {}
         }
@@ -227,22 +250,25 @@ saved_hashes = set()
 def on_message(message, data):
     if message['type'] == 'send':
         try:
-            hsh, svg = message['payload'].split("||", 1)
+            hsh, stroke_data, color = message['payload'].split("||", 2)
             if hsh not in saved_hashes:
                 saved_hashes.add(hsh)
-                svg_buffer.append(svg)
-                if len(svg_buffer) % 50 == 0:
-                    log(f"[FRIDA] Captured {len(svg_buffer)} strokes so far...")
+                
+                # Use the Geometry Engine to make it look nice
+                svg = generate_smooth_path(stroke_data, color)
+                if svg:
+                    svg_buffer.append(svg)
+                    if len(svg_buffer) % 50 == 0:
+                        log(f"[FRIDA] Captured {len(svg_buffer)} strokes so far...")
         except: pass
 
 def drive_ui():
+    # Import inside thread to ensure it's loaded after install
     import pyautogui
     
     log("[UI] Thread Started.")
     log("[UI] Waiting 5 seconds for App Window to stabilize...")
-    time.sleep(5)
-    
-    take_snapshot("app_launched")
+    time.sleep(5) 
     
     # 1. Clear Popups
     log("[UI] Step 1: Clearing Popups (Pressing Enter)...")
@@ -250,19 +276,17 @@ def drive_ui():
     time.sleep(1)
     pyautogui.press('enter') 
     time.sleep(1)
-    take_snapshot("popups_cleared")
 
     # 2. Navigate to Share Menu
-    log("[UI] Step 2: Navigating to Toolbar (8x Tab)...")
-    for i in range(8):
+    # UPDATED: 7 Tabs instead of 8 based on user feedback
+    log("[UI] Step 2: Navigating to Toolbar (7x Tab)...")
+    for i in range(7):
         pyautogui.press('tab')
         time.sleep(0.1)
     
-    take_snapshot("tabbed_to_menu")
     log("[UI] Opening Share Menu (Enter)...")
     pyautogui.press('enter') 
     time.sleep(1.5)
-    take_snapshot("menu_opened")
     
     # 3. Select PDF
     log("[UI] Step 3: Selecting PDF (Down -> Enter)...")
@@ -270,7 +294,6 @@ def drive_ui():
     time.sleep(0.2)
     pyautogui.press('enter')
     time.sleep(1.5)
-    take_snapshot("pdf_selected")
     
     # 4. Click Done
     log("[UI] Step 4: Clicking Done (Enter)...")
@@ -279,24 +302,23 @@ def drive_ui():
     
     # 5. Save Dialog
     log(f"[UI] Step 5: Handling Save Dialog...")
-    if not os.path.exists("C:\\Temp"): os.makedirs("C:\\Temp")
+    
+    if not os.path.exists("C:\\Temp"): 
+        os.makedirs("C:\\Temp")
 
     pyautogui.write(EXPORT_PDF_PATH)
     time.sleep(0.5)
-    take_snapshot("filename_typed")
-    
     pyautogui.press('enter')
     time.sleep(1.0)
     
     # Confirm Overwrite
+    log("[UI] Handling potential Overwrite popup...")
     pyautogui.press('left')
     pyautogui.press('enter')
+    
     log("[UI] Automation Sequence Complete.")
-    take_snapshot("export_started")
 
 def main():
-    global stop_threads
-
     # 1. INSTALLATION
     install_pip_deps()
     install_local_dependencies()
@@ -304,29 +326,19 @@ def main():
     
     # Late import
     import frida
-    import pyautogui # For initial system check
-
-    # 2. SYSTEM CHECK
-    check_system_capabilities()
 
     if not os.path.exists(TARGET_NOTE):
         log(f"[-] FATAL: {TARGET_NOTE} not found in working directory.")
         return
 
-    # Start Paparazzi
-    t_snap = threading.Thread(target=paparazzi_thread)
-    t_snap.daemon = True
-    t_snap.start()
-
-    # 3. LAUNCH
+    # 2. LAUNCH
     log(f"[LAUNCH] Opening {TARGET_NOTE} via Windows Shell...")
     os.startfile(TARGET_NOTE)
     
     log("[LAUNCH] Waiting 8 seconds for application startup...")
     time.sleep(8)
-    take_snapshot("startup_complete")
 
-    # 4. FRIDA ATTACH
+    # 3. FRIDA ATTACH
     try:
         log("[FRIDA] Attaching process...")
         session = frida.attach("SamsungNotes.exe")
@@ -336,21 +348,20 @@ def main():
         log("[FRIDA] Hooks injected successfully.")
     except Exception as e:
         log(f"[-] Frida Fatal Error: {e}")
-        stop_threads = True
-        take_snapshot("frida_error")
         os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
         sys.exit(1)
 
-    # 5. DRIVE UI
-    t_ui = threading.Thread(target=drive_ui)
-    t_ui.start()
-    t_ui.join()
+    # 4. DRIVE UI
+    t = threading.Thread(target=drive_ui)
+    t.start()
+    t.join()
     
-    # 6. HARVEST
+    # 5. HARVEST
     log("[HARVEST] Waiting for data stream to finish...")
     last_val = -1
     no_change = 0
     
+    # Wait max 60 seconds for export to complete
     for _ in range(60):
         time.sleep(1)
         if len(svg_buffer) > 0 and len(svg_buffer) == last_val:
@@ -359,11 +370,12 @@ def main():
             no_change = 0
         last_val = len(svg_buffer)
         
+        # If we have data and it hasn't changed for 5 seconds, we assume export is done
         if len(svg_buffer) > 0 and no_change > 5:
             log("[HARVEST] Data stream stabilized. Finishing.")
             break
             
-    # 7. SAVE OUTPUT
+    # 6. SAVE OUTPUT
     if svg_buffer:
         log(f"[SAVE] Writing {len(svg_buffer)} strokes to {OUTPUT_SVG}...")
         with open(OUTPUT_SVG, "w", encoding="utf-8") as f:
@@ -374,11 +386,11 @@ def main():
             f.write('</svg>')
         log(f"[SUCCESS] File saved: {OUTPUT_SVG}")
     else:
-        log("[-] FAILURE: No data was captured. Check Debug_Screenshots folder!")
+        log("[-] FAILURE: No data was captured. The export might have failed or UI nav was blocked.")
 
-    # 8. CLEANUP
-    stop_threads = True
-    try: session.detach()
+    # 7. CLEANUP
+    try:
+        session.detach()
     except: pass
     os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
     log("[EXIT] Process killed. Job done.")
