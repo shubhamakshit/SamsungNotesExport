@@ -6,53 +6,111 @@ import time
 import ctypes
 import threading
 import glob
+from datetime import datetime
 
 # --- CONFIGURATION ---
 SNOTES_APPX_URL = "https://huggingface.co/datasets/Jaimodiji/SAMSUNG-NOTES/resolve/main/snotes.Msixbundle"
 APP_FILENAME = "SamsungNotes.Msixbundle"
 TARGET_NOTE = "input_note.sdocx"
 OUTPUT_SVG = "Final_Export.svg"
-EXPORT_PDF_TEMP = "C:\\Temp\\dummy.pdf"
+EXPORT_PDF_PATH = r"C:\Temp\dummy_export.pdf"
+SCREENSHOT_DIR = "Debug_Screenshots"
+
+# Global flags
+stop_threads = False
+
+# --- LOGGING & SCREENSHOTS ---
+def log(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
+
+def take_snapshot(name="auto"):
+    """Captures the screen for debugging."""
+    if not os.path.exists(SCREENSHOT_DIR): os.makedirs(SCREENSHOT_DIR)
+    
+    try:
+        import pyautogui
+        timestamp = datetime.now().strftime("%H_%M_%S")
+        filename = f"{SCREENSHOT_DIR}\\{timestamp}_{name}.png"
+        pyautogui.screenshot(filename)
+        log(f"[SNAPSHOT] Saved {filename}")
+    except Exception as e:
+        log(f"[SNAPSHOT] Failed: {e}")
+
+def paparazzi_thread():
+    """Takes a screenshot every 3 seconds."""
+    while not stop_threads:
+        take_snapshot("interval")
+        time.sleep(3)
+
+# --- SYSTEM CHECKS ---
+def check_system_capabilities():
+    log("[SYSTEM] Verifying Display and Mouse subsystems...")
+    
+    try:
+        user32 = ctypes.windll.user32
+        
+        # 1. Check Screen Resolution
+        width = user32.GetSystemMetrics(0)
+        height = user32.GetSystemMetrics(1)
+        log(f"[SYSTEM] Virtual Display Detected: {width}x{height}")
+        
+        if width == 0 or height == 0:
+            log("[-] FATAL: No display detected. UI Automation will fail.")
+            sys.exit(1)
+
+        # 2. Check Cursor
+        pt = ctypes.wintypes.POINT()
+        if user32.GetCursorPos(ctypes.byref(pt)):
+            log(f"[SYSTEM] Mouse Cursor active at ({pt.x}, {pt.y})")
+        else:
+            log("[-] Warning: Could not get cursor position.")
+
+    except Exception as e:
+        log(f"[-] System Check Error: {e}")
+        # We continue anyway because sometimes CI environments are weird
 
 # --- INSTALLATION LOGIC ---
 
 def install_pip_deps():
-    print("[*] Installing Python Dependencies...")
-    # FIX: Added pyautogui and pillow explicitly
+    log("[SETUP] Installing Python Dependencies...")
     packages = ["frida", "frida-tools", "uiautomation", "requests", "pyautogui", "pillow"]
     subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages)
 
 def install_local_dependencies():
-    print("[*] Installing Dependency Appx files from Repo...")
+    log("[SETUP] Looking for Dependency Appx files in repo...")
     dep_files = glob.glob("*.Appx") + glob.glob("*.AppxBundle")
     
     for dep in dep_files:
         if "SamsungNotes" in dep: continue
-        print(f"    -> Installing {dep}...")
+        log(f"[SETUP] Installing Dependency: {dep}")
         try:
             subprocess.run(["powershell", "Add-AppxPackage", "-Path", f".\\{dep}"], check=True)
-        except:
-            print(f"    [!] Warning: Failed to install {dep}")
+        except Exception as e:
+            log(f"[SETUP] Warning: Failed to install {dep}")
 
 def install_samsung_notes():
     if not os.path.exists(APP_FILENAME):
-        print(f"[*] Downloading Samsung Notes from HuggingFace...")
+        log(f"[SETUP] Downloading Samsung Notes from HuggingFace...")
         try:
             import requests
             response = requests.get(SNOTES_APPX_URL, stream=True)
             with open(APP_FILENAME, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print("[+] Download Complete.")
+            log("[SETUP] Download Complete.")
         except Exception as e:
-            print(f"[-] Download Failed: {e}")
+            log(f"[SETUP] Critical Error: Download Failed: {e}")
             sys.exit(1)
     
-    print("[*] Installing Samsung Notes...")
-    # ForceUpdateFromAnyVersion allows reinstalling over existing versions
+    log("[SETUP] Installing Samsung Notes Appx...")
     cmd = ["powershell", "Add-AppxPackage", "-Path", APP_FILENAME, "-ForceUpdateFromAnyVersion", "-AllowUnsigned"]
-    subprocess.run(cmd, capture_output=True, text=True)
-    print("[+] App Install Process Finished.")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        log(f"[SETUP] App Install Warning (Output): {result.stderr}")
+    else:
+        log("[SETUP] App Installed Successfully.")
 
 # --- FRIDA LOGIC ---
 
@@ -130,11 +188,10 @@ function main() {
                     let p = pointsPtr.add(i * 8);
                     let x = p.readFloat().toFixed(2);
                     let y = p.add(4).readFloat().toFixed(2);
-                    let cur = x + "," + y;
                     
                     if (pts.length === 0 || cur !== pts[pts.length-1]) {
-                        pts.push(cur);
-                        rawData += cur; 
+                        pts.push(x + "," + y);
+                        rawData += x + y; 
                     }
                 }
 
@@ -174,109 +231,127 @@ def on_message(message, data):
             if hsh not in saved_hashes:
                 saved_hashes.add(hsh)
                 svg_buffer.append(svg)
-                sys.stdout.write(f"\r[+] Captured: {len(svg_buffer)} strokes   ")
-                sys.stdout.flush()
+                if len(svg_buffer) % 50 == 0:
+                    log(f"[FRIDA] Captured {len(svg_buffer)} strokes so far...")
         except: pass
 
 def drive_ui():
-    # Import inside thread to ensure it's loaded after install
     import pyautogui
     
-    print("\n[UI] Waiting for App Window...")
-    time.sleep(5) 
+    log("[UI] Thread Started.")
+    log("[UI] Waiting 5 seconds for App Window to stabilize...")
+    time.sleep(5)
+    
+    take_snapshot("app_launched")
     
     # 1. Clear Popups
-    print("    -> Clearing potential First-Run popups...")
+    log("[UI] Step 1: Clearing Popups (Pressing Enter)...")
     pyautogui.press('enter') 
     time.sleep(1)
     pyautogui.press('enter') 
     time.sleep(1)
+    take_snapshot("popups_cleared")
 
     # 2. Navigate to Share Menu
-    print("    -> Navigating to Share...")
+    log("[UI] Step 2: Navigating to Toolbar (8x Tab)...")
     for i in range(8):
         pyautogui.press('tab')
         time.sleep(0.1)
     
-    pyautogui.press('enter') # Open Menu
+    take_snapshot("tabbed_to_menu")
+    log("[UI] Opening Share Menu (Enter)...")
+    pyautogui.press('enter') 
     time.sleep(1.5)
+    take_snapshot("menu_opened")
     
     # 3. Select PDF
-    print("    -> Selecting PDF...")
+    log("[UI] Step 3: Selecting PDF (Down -> Enter)...")
     pyautogui.press('down')
     time.sleep(0.2)
     pyautogui.press('enter')
     time.sleep(1.5)
+    take_snapshot("pdf_selected")
     
     # 4. Click Done
-    print("    -> Confirming Share...")
+    log("[UI] Step 4: Clicking Done (Enter)...")
     pyautogui.press('enter')
     time.sleep(1.5)
     
     # 5. Save Dialog
-    print("    -> Saving Dummy File...")
+    log(f"[UI] Step 5: Handling Save Dialog...")
     if not os.path.exists("C:\\Temp"): os.makedirs("C:\\Temp")
-    
+
     pyautogui.write(EXPORT_PDF_PATH)
     time.sleep(0.5)
+    take_snapshot("filename_typed")
+    
     pyautogui.press('enter')
     time.sleep(1.0)
     
     # Confirm Overwrite
     pyautogui.press('left')
     pyautogui.press('enter')
-    print("[UI] Export Sequence Complete.")
+    log("[UI] Automation Sequence Complete.")
+    take_snapshot("export_started")
 
 def main():
+    global stop_threads
+
     # 1. INSTALLATION
     install_pip_deps()
     install_local_dependencies()
     install_samsung_notes()
     
-    import frida # Now safe to import
+    # Late import
+    import frida
+    import pyautogui # For initial system check
+
+    # 2. SYSTEM CHECK
+    check_system_capabilities()
 
     if not os.path.exists(TARGET_NOTE):
-        print(f"[-] Target {TARGET_NOTE} not found.")
+        log(f"[-] FATAL: {TARGET_NOTE} not found in working directory.")
         return
 
-    # 2. LAUNCH
-    print(f"[*] Launching {TARGET_NOTE}...")
+    # Start Paparazzi
+    t_snap = threading.Thread(target=paparazzi_thread)
+    t_snap.daemon = True
+    t_snap.start()
+
+    # 3. LAUNCH
+    log(f"[LAUNCH] Opening {TARGET_NOTE} via Windows Shell...")
     os.startfile(TARGET_NOTE)
     
-    print("[*] Waiting 8 seconds for app startup...")
+    log("[LAUNCH] Waiting 8 seconds for application startup...")
     time.sleep(8)
+    take_snapshot("startup_complete")
 
-    # 3. FRIDA ATTACH
+    # 4. FRIDA ATTACH
     try:
-        print("[*] Attaching Data Thief...")
+        log("[FRIDA] Attaching process...")
         session = frida.attach("SamsungNotes.exe")
         script = session.create_script(jscode)
         script.on("message", on_message)
         script.load()
+        log("[FRIDA] Hooks injected successfully.")
     except Exception as e:
-        print(f"[-] Failed to attach Frida: {e}")
+        log(f"[-] Frida Fatal Error: {e}")
+        stop_threads = True
+        take_snapshot("frida_error")
         os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
-        return
+        sys.exit(1)
 
-    # 4. DRIVE UI
-    # Force import check before thread start
-    try:
-        import pyautogui
-    except ImportError:
-        print("[-] FATAL: PyAutoGUI missing. Re-running install...")
-        install_pip_deps()
-        import pyautogui
-
-    t = threading.Thread(target=drive_ui)
-    t.start()
-    t.join()
+    # 5. DRIVE UI
+    t_ui = threading.Thread(target=drive_ui)
+    t_ui.start()
+    t_ui.join()
     
-    # 5. HARVEST
-    print("[*] Listening for data stream...")
+    # 6. HARVEST
+    log("[HARVEST] Waiting for data stream to finish...")
     last_val = -1
     no_change = 0
     
-    for _ in range(45):
+    for _ in range(60):
         time.sleep(1)
         if len(svg_buffer) > 0 and len(svg_buffer) == last_val:
             no_change += 1
@@ -285,23 +360,28 @@ def main():
         last_val = len(svg_buffer)
         
         if len(svg_buffer) > 0 and no_change > 5:
+            log("[HARVEST] Data stream stabilized. Finishing.")
             break
             
-    # 6. SAVE OUTPUT
+    # 7. SAVE OUTPUT
     if svg_buffer:
+        log(f"[SAVE] Writing {len(svg_buffer)} strokes to {OUTPUT_SVG}...")
         with open(OUTPUT_SVG, "w", encoding="utf-8") as f:
             f.write('<?xml version="1.0" standalone="no"?>\n')
             f.write('<svg width="5000" height="200000" version="1.1" xmlns="http://www.w3.org/2000/svg" style="background-color:white">\n')
             for line in svg_buffer:
                 f.write(line + "\n")
             f.write('</svg>')
-        print(f"\n[+] SUCCESS! Saved to {OUTPUT_SVG}")
+        log(f"[SUCCESS] File saved: {OUTPUT_SVG}")
     else:
-        print("\n[-] No data captured.")
+        log("[-] FAILURE: No data was captured. Check Debug_Screenshots folder!")
 
-    # 7. CLEANUP
-    session.detach()
+    # 8. CLEANUP
+    stop_threads = True
+    try: session.detach()
+    except: pass
     os.system("taskkill /f /im SamsungNotes.exe >nul 2>&1")
+    log("[EXIT] Process killed. Job done.")
 
 if __name__ == "__main__":
     main()
