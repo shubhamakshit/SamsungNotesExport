@@ -6,10 +6,22 @@ on:
       sdocx_url:
         description: 'Direct URL to .sdocx file'
         required: true
+      min_dist:
+        description: 'Smoothing Distance (px)'
+        required: false
+        default: '2.0'
+      thin_scale:
+        description: 'Thinning Scale (0.1 - 1.0)'
+        required: false
+        default: '0.5'
 
 jobs:
   export:
     runs-on: windows-latest
+    
+    env:
+      OPT_SMOOTH_DIST: ${{ github.event.inputs.min_dist }}
+      OPT_THIN_SCALE: ${{ github.event.inputs.thin_scale }}
     
     steps:
     - name: Checkout Repo
@@ -29,9 +41,16 @@ jobs:
       run: python export_script.py
       shell: cmd
 
-    - name: Upload SVG
-      if: always()
+    - name: Upload SVG (Success)
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: Converted-SVG
         path: Final_Export.svg
+
+    - name: Upload Debug Screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Debug-Screenshots
+        path: Debug_Screenshots/
