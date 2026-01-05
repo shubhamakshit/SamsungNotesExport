@@ -29,16 +29,9 @@ jobs:
       run: python export_script.py
       shell: cmd
 
-    - name: Upload SVG (Success)
-      if: success()
+    - name: Upload SVG
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: Converted-SVG
         path: Final_Export.svg
-
-    - name: Upload Debug Screenshots (Always)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: Debug-Screenshots
-        path: Debug_Screenshots/
